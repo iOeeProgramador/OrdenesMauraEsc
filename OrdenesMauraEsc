@@ -1,0 +1,94 @@
+import streamlit as st
+import pandas as pd
+import zipfile
+import io
+import boto3
+from datetime import datetime
+import re
+
+# Configuración AWS (seguro solo para desarrollo)
+AWS_ACCESS_KEY = "AKIA2WT4Y2S2ZL4VGTU"
+AWS_SECRET_KEY = "YBtGPttCXW50sFSaodNbdBjGLrcqQbgl4/vez+rc"
+BUCKET_NAME = "mia-datos-combinados"
+REGION = "us-east-1"
+
+# Inicializar cliente S3
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=REGION
+)
+
+def leer_excel_s3(nombre_archivo):
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=nombre_archivo)
+    return pd.read_excel(io.BytesIO(obj["Body"].read()))
+
+def leer_csv_s3(nombre_archivo):
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=nombre_archivo)
+    return pd.read_csv(io.BytesIO(obj["Body"].read()))
+
+def guardar_excel_s3(df, nombre_archivo):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Datos')
+    buffer.seek(0)
+    s3.upload_fileobj(buffer, BUCKET_NAME, nombre_archivo)
+
+st.set_page_config(layout="wide")
+st.title("Procesador de archivos MIA")
+
+modo = st.radio("Selecciona el modo de operación:", ("Actualizar fuentes", "Actualizar desde Responsable", "Revisar DatosCombinados"))
+
+if modo == "Actualizar fuentes":
+    st.header("Actualizar ORDENES e INVENTARIO desde S3")
+    try:
+        df_ordenes = leer_csv_s3("ORDENES.csv")
+        df_inventario = leer_csv_s3("INVENTARIO.csv")
+
+        df_ordenes.columns = [f"{col}_ORDENES" for col in df_ordenes.columns]
+        df_inventario.columns = [f"{col}_INVENTARIO" for col in df_inventario.columns]
+
+        df_inventario_unique = df_inventario.drop_duplicates(subset=["Cod. Producto_INVENTARIO"])
+        df_combinado = pd.merge(df_ordenes, df_inventario_unique, left_on="LPROD_ORDENES", right_on="Cod. Producto_INVENTARIO", how="left")
+
+        guardar_excel_s3(df_combinado, "DatosCombinados.xlsx")
+        st.success("DatosCombinados generado y guardado exitosamente en S3")
+        st.dataframe(df_combinado, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error al procesar fuentes: {e}")
+
+elif modo == "Actualizar desde Responsable":
+    st.header("Actualizar desde archivo del Responsable en S3")
+    responsable_nombre = st.text_input("Nombre del archivo del Responsable (ej: Constanza_Gonzalez_20250513.xlsx):")
+    if responsable_nombre:
+        try:
+            df_combinado = leer_excel_s3("DatosCombinados.xlsx")
+            df_update = leer_excel_s3(responsable_nombre)
+
+            # Generar respaldo
+            guardar_excel_s3(df_combinado, f"respaldo/DatosCombinados_{datetime.today().strftime('%Y%m%d_%H%M%S')}.xlsx")
+
+            df_update["KEY"] = df_update["LORD_ORDENES"].astype(str) + df_update["LLINE_ORDENES"].astype(str)
+            df_combinado["KEY"] = df_combinado["LORD_ORDENES"].astype(str) + df_combinado["LLINE_ORDENES"].astype(str)
+
+            df_combinado.set_index("KEY", inplace=True)
+            df_update.set_index("KEY", inplace=True)
+            for col in ["ESTADO_ESTADO", "OBSERVACION_ESTADO"]:
+                if col in df_update.columns:
+                    df_combinado.loc[df_update.index, col] = df_update[col]
+            df_combinado.reset_index(inplace=True)
+
+            guardar_excel_s3(df_combinado, "DatosCombinados.xlsx")
+            st.success("Archivo del responsable procesado y DatosCombinados actualizado en S3")
+            st.dataframe(df_combinado, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error al actualizar desde responsable: {e}")
+
+elif modo == "Revisar DatosCombinados":
+    try:
+        df_combinado = leer_excel_s3("DatosCombinados.xlsx")
+        st.subheader("Vista previa de DatosCombinados")
+        st.dataframe(df_combinado, use_container_width=True)
+    except Exception as e:
+        st.error(f"No se pudo cargar DatosCombinados desde S3: {e}")
